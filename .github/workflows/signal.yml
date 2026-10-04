@@ -2,10 +2,10 @@ name: TAA Satellite Signal
 
 on:
   schedule:
-    # 20:40 UTC = 다음날 05:40 KST
+    # 21:43 UTC = 다음날 06:43 KST
     # GitHub 예약 실행은 30분 지연될 수 있어 30분 앞당겨 둡니다.
     # UTC 일~금(0-5) = KST 월~토 → 일요일 수신 제외
-    - cron: "40 20 * * 0-5"
+    - cron: "43 21 * * 0-5"
   workflow_dispatch:        # Actions 탭에서 수동 실행 버튼
 
 permissions:
