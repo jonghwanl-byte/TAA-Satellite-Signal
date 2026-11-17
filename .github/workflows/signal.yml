@@ -1,51 +1,32 @@
 name: TAA Satellite Signal
 
+# cron-job.org 가 매일 06:30(KST) 에 workflow_dispatch 를 호출한다.
+# (GitHub 자체 schedule 은 지연이 잦아 사용하지 않는다. 필요하면 아래 주석을 해제)
 on:
-#  schedule:
-    # 21:43 UTC = 다음날 06:43 KST
-    # GitHub 예약 실행은 30분 지연될 수 있어 30분 앞당겨 둡니다.
-    # UTC 일~금(0-5) = KST 월~토 → 일요일 수신 제외
-#    - cron: "43 21 * * 0-5"
-  workflow_dispatch:        # Actions 탭에서 수동 실행 버튼
-
-permissions:
-  contents: read
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "30 21 * * 0-4"   # 21:30 UTC = 06:30 KST (월~금)
 
 concurrency:
-  group: taa-satellite-signal
+  group: taa-signal
   cancel-in-progress: false
 
 jobs:
   signal:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -c "import yfinance, pandas; print('yfinance', yfinance.__version__, '| pandas', pandas.__version__)"
-          python -c "import pykrx; print('pykrx OK')"
-
-      - name: Run signal bot
+      - run: pip install -r requirements.txt
+      - name: 신호 계산 및 텔레그램 전송
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # 선택: 평가액(KRW)을 넣으면 목표 수량(주)까지 계산
-          PORTFOLIO_VALUE: ${{ vars.PORTFOLIO_VALUE }}
-          # 선택: "false" 로 두면 비중 변동이 있을 때만 전송
+          PORTFOLIO_VALUE: ${{ secrets.PORTFOLIO_VALUE }}
           ALWAYS_SEND: ${{ vars.ALWAYS_SEND }}
-          # 선택: 소스 우선순위 재정의 (기본 pykrx,history,download)
           PRICE_SOURCE: ${{ vars.PRICE_SOURCE }}
-          TZ: Asia/Seoul
-        run: python satellite_signal.py
+        run: python taa_signal.py
