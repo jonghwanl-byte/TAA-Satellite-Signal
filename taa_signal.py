@@ -9,6 +9,9 @@ TAA Satellite Signal — 국내 상장 해외/국가 대표지수 ETF 범용 추
     그 사이   : 전일 상태 유지
   목표 비중 = (켜진 일봉 이평선 수 / 4) x 자산별 한도(20%)
   주봉(20/60주)은 참고 표시 전용 (비중 계산에 쓰지 않음)
+  [주식형만] 변동성 손절: 보유 중 추적 고점 대비 하락폭이
+    k x 일별변동성(60일) x sqrt(20) (k=2) 를 넘으면 전량 청산하고,
+    이평선 4개가 모두 OFF가 될 때까지 재진입하지 않는다. 국고채30년은 손절 없음(관찰 중).
 
 [집행] 당일 종가로 신호를 계산하고 다음 거래일 종가 무렵(14시경)에 매매한다.
 
@@ -37,6 +40,7 @@ import requests
 # ===== 설정 ============================================================
 ASSETS = {                                  # 코드: 이름
     "069500": "KODEX 200",
+    "229200": "KODEX 코스닥150",
     "283580": "KODEX 중국본토CSI300",
     "241180": "TIGER 니케이225",
     "453810": "KODEX 인도Nifty50",
@@ -44,6 +48,8 @@ ASSETS = {                                  # 코드: 이름
 }
 DAILY_MA = (20, 60, 120, 200)
 WEEKLY_MA = (20, 60)
+STOP_ASSETS = {"069500", "229200", "283580", "241180", "453810"}   # 손절 적용(주식형). 국고채 385560 제외
+STOP_K, STOP_VOL_WIN, STOP_HOR = 2.0, 60, 20
 BAND = 0.02                 # 진입 +2% / 이탈 -2%
 CAP = 0.20                  # 자산별 한도
 NEAR = 0.005                # 전환선까지 0.5%p 이내면 '전환 임박'
@@ -129,6 +135,14 @@ def _via_history(code):
 SOURCES = {"pykrx": _via_pykrx, "naver": _via_naver, "history": _via_history}
 
 
+def _drop_incomplete(s):
+    """장중에 받아 미완성인 오늘 봉(15:40 KST 이전)은 제외한다."""
+    now = datetime.now(KST)
+    if len(s) and s.index[-1].date() == now.date() and (now.hour, now.minute) < (15, 40):
+        return s.iloc[:-1]
+    return s
+
+
 def fetch_one(code):
     """(Series, 소스, 오류) — 소스 순서대로 시도, 가장 긴 히스토리 채택."""
     need = max(DAILY_MA) + 60
@@ -150,31 +164,30 @@ def fetch_one(code):
                     time.sleep(3 * k)
         if best is not None and len(best) >= need:
             break
-    return best, src, ("; ".join(errs) if errs else None)
+    return (_drop_incomplete(best) if best is not None else None), src, ("; ".join(errs) if errs else None)
 
 
 # ---------- 신호 계산 ---------------------------------------------------
-def states(close, ma):
-    """히스테리시스 상태열. 첫 유효일은 종가>MA 로 초기화한다."""
-    s, out = np.nan, np.full(len(close), np.nan)
+def states(close, ma, start=0):
+    """히스테리시스 상태열. 이평선이 처음 계산되는 날은 OFF로 시작하고(백테스트와 동일),
+    +밴드를 넘어야 ON이 된다."""
+    s, out = 0.0, np.full(len(close), np.nan)
     for i, (x, m) in enumerate(zip(close, ma)):
-        if np.isnan(m):
+        if np.isnan(m) or i < start:
             continue
         if x > m * (1 + BAND):
             s = 1.0
         elif x < m * (1 - BAND):
             s = 0.0
-        elif np.isnan(s):
-            s = 1.0 if x > m else 0.0
         out[i] = s
     return out
 
 
-def analyze(c, wins):
+def analyze(c, wins, start=0):
     rows = []
     for n in wins:
         ma = c.rolling(n).mean()
-        st = states(c.values, ma.values)
+        st = states(c.values, ma.values, start)
         ok = len(c) >= n
         x = c.iloc[-1]
         rows.append(dict(
@@ -190,6 +203,39 @@ def near_flip(a):
         return False
     dist = a["gap"] + BAND if a["st"] == 1 else BAND - a["gap"]
     return dist <= NEAR
+
+
+
+def base_weight_series(c):
+    """일봉 이평선 4개 ON 비율(0~1) 시계열. 200일 미만 구간은 0."""
+    st = np.vstack([states(c.values, c.rolling(n).mean().values, max(DAILY_MA) - 1) for n in DAILY_MA])
+    w = st.mean(axis=0)
+    w = np.where(np.isnan(w), 0.0, w)
+    w[:max(DAILY_MA) - 1] = 0.0
+    return w
+
+
+def apply_vol_stop(c, base):
+    """변동성 손절 오버레이. 경로 의존적이므로 전체 히스토리로 계산한다.
+    반환: (최종 비중열, 현재 손절상태, 추적고점, 현재 손절폭)"""
+    px = c.values
+    sig = pd.Series(px).pct_change().rolling(STOP_VOL_WIN).std().values
+    w = np.zeros(len(px)); peak, stopped, prev, stop = 0.0, False, 0.0, np.nan
+    for t in range(len(px)):
+        b = base[t]
+        if b == 0:
+            stopped, peak = False, 0.0
+        if not stopped:
+            if b > 0 and prev == 0:
+                peak = px[t]
+            if b > 0:
+                peak = max(peak, px[t])
+                stop = STOP_K * sig[t] * np.sqrt(STOP_HOR) if not np.isnan(sig[t]) else 9.0
+                if px[t] <= peak * (1 - stop):
+                    stopped = True
+        w[t] = 0.0 if stopped else b
+        prev = b
+    return w, stopped, peak, stop
 
 
 # ---------- 리포트 ------------------------------------------------------
@@ -213,10 +259,15 @@ def build_report():
             continue
         n_ok += 1
         w = c.resample("W-FRI").last().dropna()
-        D, W = analyze(c, DAILY_MA), analyze(w, WEEKLY_MA)
-        on = int(sum(a["st"] == 1 for a in D))
-        pon = int(sum(a["prev"] == 1 for a in D))
-        tw, pw = on / 4 * CAP, pon / 4 * CAP
+        D, W = analyze(c, DAILY_MA, max(DAILY_MA) - 1), analyze(w, WEEKLY_MA)
+        base = base_weight_series(c)
+        use_stop = code in STOP_ASSETS
+        if use_stop:
+            wser, stopped, peak, stop = apply_vol_stop(c, base)
+        else:
+            wser, stopped, peak, stop = base, False, np.nan, np.nan
+        tw, pw = wser[-1] * CAP, wser[-2] * CAP
+        on, pon = round(wser[-1] * 4), round(wser[-2] * 4)
         d1 = c.iloc[-1] / c.iloc[-2] - 1
         arrow = "▲" if d1 > 0 else "▼" if d1 < 0 else ""
         last = c.index[-1].date()
@@ -225,16 +276,28 @@ def build_report():
         top.append(f"일 {''.join(dot(a['st']) for a in D)}  "
                    f"주 {''.join(dot(a['st']) for a in W)}  "
                    f"전일대비 {arrow}{abs(d1) * 100:.1f}%")
-        if on != pon:
-            verb = "비중확대" if on > pon else "비중축소"
+        if tw != pw:
+            verb = "비중확대" if tw > pw else "비중축소"
             top.append(f"목표 {tw * 100:.0f}% (한도 {CAP * 100:.0f}% 중)  "
-                       f"{'▲' if on > pon else '▼'} {verb} {pw * 100:.0f}%→{tw * 100:.0f}%")
+                       f"{'▲' if tw > pw else '▼'} {verb} {pw * 100:.0f}%→{tw * 100:.0f}%")
             notable = True
         else:
             top.append(f"목표 {tw * 100:.0f}% (한도 {CAP * 100:.0f}% 중)  변동없음")
         if pv > 0:
             amt = pv * tw
             top.append(f"   ≈ {amt:,.0f}원 / {int(amt // c.iloc[-1])}주")
+        if use_stop:
+            if stopped:
+                top.append(f"🛑 손절 상태 (고점 {c.iloc[-1] / peak - 1:+.1%}, 손절선 -{stop:.1%}) — 이평선 전부 OFF 후 재진입")
+                notable = True
+            elif base[-1] > 0:
+                dd = c.iloc[-1] / peak - 1
+                room = stop + dd
+                top.append(f"손절선 -{stop:.1%} / 고점대비 {dd:+.1%} (여유 {room * 100:.1f}%p)"
+                           + ("  ⚠ 손절 임박" if room <= 0.2 * stop else ""))
+                notable = notable or room <= 0.2 * stop
+        else:
+            top.append("손절 없음 (관찰 중)")
         near = [a for a in D if near_flip(a)]
         if near:
             top.append("⚠ 전환 임박: " + ", ".join(f"일{a['n']}" for a in near))
@@ -252,7 +315,7 @@ def build_report():
         bot.append("")
 
     top.append("● ON  ○ OFF  - 데이터부족 (20/60/120/200)")
-    top.append("목표=켜진 일봉 수÷4×한도 · 주봉은 참고")
+    top.append("목표=켜진 일봉 수÷4×한도(손절 시 0) · 주봉은 참고")
     bot.append("</pre>")
     return "\n".join(top) + "\n━━━━━━━━━━\n" + "\n".join(bot), notable, n_ok
 
